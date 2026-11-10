@@ -1,70 +1,112 @@
 diff --git a/src/partsbinpalette/binmanager/binmanager.cpp b/src/partsbinpalette/binmanager/binmanager.cpp
 --- a/src/partsbinpalette/binmanager/binmanager.cpp
 +++ b/src/partsbinpalette/binmanager/binmanager.cpp
-@@ -27,6 +27,8 @@
+@@ -27,6 +27,10 @@
  #include <QInputDialog>
  #include <QDropEvent>
  #include <QMimeData>
 +#include <QApplication>
 +#include <QElapsedTimer>
++#include <QFile>
++#include <QDir>
  
  #include "binmanager.h"
  #include "stacktabwidget.h"
-@@ -963,7 +965,6 @@
- 	FileProgressDialog progress(tr("Searching..."), 0, this);
- 	progress.setIncValueMod(10);
- 	connect(m_referenceModel, SIGNAL(addSearchMaximum(int)), &progress, SLOT(addMaximum(int)));
+@@ -960,10 +964,6 @@
+ 	PartsBinPaletteWidget * searchBin = getOrOpenSearchBin();
+ 	if (searchBin == nullptr) return;
+ 
+-	FileProgressDialog progress(tr("Searching..."), 0, this);
+-	progress.setIncValueMod(10);
+-	connect(m_referenceModel, SIGNAL(addSearchMaximum(int)), &progress, SLOT(addMaximum(int)));
 -	connect(m_referenceModel, SIGNAL(incSearch()), &progress, SLOT(incValue()));
  
  	QString effectiveSearchText = searchText;
  	bool allowObsolete = false;
-@@ -979,9 +980,25 @@
+@@ -977,23 +977,81 @@
+ 			effectiveSearchText = stripped;
+ 		}
  	}
- 	QList<ModelPart *> modelParts = m_referenceModel->search(effectiveSearchText, allowObsolete);
- 
--	progress.setIncValueMod(1);
 +	// One widget per result used to be created while pumping the event loop for every
 +	// scanned and matched part: the visible bin repainted and re-ran its flow layout
 +	// thousands of times per search, freezing the UI for minutes. Create the result
 +	// widgets in a batch with repaints paused, and stop after a time budget or a cap.
-+	const int maxSearchResults = 300;
-+	const qint64 maxSearchMillis = 5000;
-+	QElapsedTimer searchTimer;
-+	searchTimer.start();
++	int maxSearchResults = qEnvironmentVariableIntValue("FRITZING_SEARCH_MAX_RESULTS");
++	if (maxSearchResults <= 0) maxSearchResults = 300;
++	qint64 maxSearchMillis = qEnvironmentVariableIntValue("FRITZING_SEARCH_MAX_MS");
++	if (maxSearchMillis <= 0) maxSearchMillis = 5000;
++	const bool timingEnabled = !qEnvironmentVariableIsEmpty("FRITZING_SEARCH_TIMING");
++	auto logTiming = [timingEnabled](const QString & line) {
++		if (!timingEnabled) return;
++		QFile logFile(QDir::tempPath() + "/fritzing-search-timing.log");
++		if (logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
++			logFile.write(line.toUtf8());
++			logFile.write("\n");
++		}
++	};
++	QElapsedTimer totalTimer;
++	totalTimer.start();
++	logTiming(QString("--- search start '%1'").arg(searchText));
++
++	QElapsedTimer phaseTimer;
++	phaseTimer.start();
+ 	QList<ModelPart *> modelParts = m_referenceModel->search(effectiveSearchText, allowObsolete);
++	logTiming(QString("model search: %1 ms, %2 matches").arg(phaseTimer.restart()).arg(modelParts.count()));
++
 +	int displayed = 0;
 +	bool truncated = false;
-+
+ 
+-	progress.setIncValueMod(1);
 +	searchBin->setUpdatesEnabled(false);
  	searchBin->removeParts();
++	logTiming(QString("removeParts: %1 ms").arg(phaseTimer.restart()));
 +	searchBin->beginBulkAdd();
++	logTiming(QString("beginBulkAdd: %1 ms").arg(phaseTimer.restart()));
  	Q_FOREACH (ModelPart * modelPart, modelParts) {
-+		if (displayed >= maxSearchResults || searchTimer.elapsed() >= maxSearchMillis) {
++		if (displayed >= maxSearchResults || phaseTimer.elapsed() >= maxSearchMillis) {
 +			truncated = true;
 +			break;
 +		}
  		//DebugDialog::debug(modelPart->title());
  		if (modelPart->itemType() == ModelPart::SchematicSubpart) {
  		}
-@@ -989,8 +1006,18 @@
+ 		else if (modelPart->moduleID().contains(PartFactory::OldSchematicPrefix)) {
  		}
  		else {
++			QElapsedTimer itemTimer;
++			itemTimer.start();
  			this->addPartTo(searchBin, modelPart, false);
 +			displayed++;
++			const qint64 itemElapsed = itemTimer.elapsed();
++			if (itemElapsed >= 100) {
++				logTiming(QString("slow item: %1 ms '%2' %3").arg(itemElapsed).arg(modelPart->title(), modelPart->moduleID()));
++			}
 +			if (displayed % 40 == 0) {
 +				QApplication::processEvents();
 +			}
  		}
 -		progress.incValue();
 +	}
++	logTiming(QString("add loop: %1 ms, displayed %2, truncated %3").arg(phaseTimer.restart()).arg(displayed).arg(truncated));
 +	searchBin->endBulkAdd();
++	logTiming(QString("endBulkAdd: %1 ms").arg(phaseTimer.restart()));
 +	searchBin->setUpdatesEnabled(true);
++	logTiming(QString("setUpdatesEnabled(true): %1 ms").arg(phaseTimer.restart()));
 +	searchBin->update();
++	if (timingEnabled) {
++		QApplication::processEvents();
++	}
++	logTiming(QString("update+paint: %1 ms").arg(phaseTimer.restart()));
 +
 +	if (truncated && m_mainWindow != nullptr) {
 +		m_mainWindow->statusMessage(tr("Showing the first %1 search results. Refine your search to see more.").arg(displayed), 8000);
  	}
  
  	setDirtyTab(searchBin);
++	logTiming(QString("=== search done: %1 ms").arg(totalTimer.elapsed()));
+ }
+ 
+ bool BinManager::currentViewIsIconView() {
 diff --git a/src/partsbinpalette/partsbinview.h b/src/partsbinpalette/partsbinview.h
 --- a/src/partsbinpalette/partsbinview.h
 +++ b/src/partsbinpalette/partsbinview.h
