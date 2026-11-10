@@ -138,7 +138,7 @@ diff --git a/src/partsbinpalette/partsbinview.h b/src/partsbinpalette/partsbinvi
 diff --git a/src/partsbinpalette/partsbinview.cpp b/src/partsbinpalette/partsbinview.cpp
 --- a/src/partsbinpalette/partsbinview.cpp
 +++ b/src/partsbinpalette/partsbinview.cpp
-@@ -23,6 +23,16 @@
+@@ -23,6 +23,18 @@
  #include <QDrag>
  #include <QDragEnterEvent>
  #include <QMessageBox>
@@ -146,16 +146,18 @@ diff --git a/src/partsbinpalette/partsbinview.cpp b/src/partsbinpalette/partsbin
 +#include <QThread>
 +#include <QFile>
 +#include <QFileInfo>
++#include <QDir>
 +#include <QImage>
 +#include <QColor>
 +#include <QPainter>
 +#include <QCoreApplication>
 +#include <QMetaObject>
++#include <QElapsedTimer>
 +#include <QSvgRenderer>
  
  #include "itemdrag.h"
  #include "items/itembase.h"
-@@ -33,6 +43,110 @@
+@@ -33,6 +45,120 @@
  
  QHash<QString, QString> PartsBinView::TranslatedCategoryNames;
  QHash<QString, ItemBase *> PartsBinView::ItemBaseHash;
@@ -193,6 +195,8 @@ diff --git a/src/partsbinpalette/partsbinview.cpp b/src/partsbinpalette/partsbin
 +	IconRenderTask(const QString & key, const QString & svgFilename) : m_key(key), m_svgFilename(svgFilename) {}
 +
 +	void run() override {
++		QElapsedTimer timer;
++		timer.start();
 +		QByteArray bytes;
 +		QFile file(m_svgFilename);
 +		if (file.open(QIODevice::ReadOnly)) {
@@ -208,7 +212,9 @@ diff --git a/src/partsbinpalette/partsbinview.cpp b/src/partsbinpalette/partsbin
 +			}
 +		}
 +		const QString key = m_key;
-+		QMetaObject::invokeMethod(QCoreApplication::instance(), [key, icon42, icon80]() {
++		const qint64 elapsed = timer.elapsed();
++		const qint64 byteCount = bytes.size();
++		QMetaObject::invokeMethod(QCoreApplication::instance(), [key, icon42, icon80, elapsed, byteCount]() {
 +			QPixmap pixmap42(42, 42);
 +			pixmap42.fill(Qt::white);
 +			if (!icon42.isNull()) {
@@ -223,6 +229,12 @@ diff --git a/src/partsbinpalette/partsbinview.cpp b/src/partsbinpalette/partsbin
 +			}
 +			PartsBinView::IconPixmapCache.insert(key, pixmap42);
 +			PartsBinView::IconPixmapCache.insert(key + "80", pixmap80);
++			if (!qEnvironmentVariableIsEmpty("FRITZING_SEARCH_TIMING")) {
++				QFile logFile(QDir::tempPath() + "/fritzing-search-timing.log");
++				if (logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
++					logFile.write(QString("async icon %1: %2 ms, %3 bytes\n").arg(key).arg(elapsed).arg(byteCount).toUtf8());
++				}
++			}
 +			PartsBinView::finishIconRender(key);
 +		}, Qt::QueuedConnection);
 +	}
