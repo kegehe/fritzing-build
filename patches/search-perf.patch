@@ -110,20 +110,27 @@ diff --git a/src/partsbinpalette/binmanager/binmanager.cpp b/src/partsbinpalette
 diff --git a/src/partsbinpalette/partsbinview.h b/src/partsbinpalette/partsbinview.h
 --- a/src/partsbinpalette/partsbinview.h
 +++ b/src/partsbinpalette/partsbinview.h
-@@ -26,6 +26,7 @@
+@@ -26,6 +26,8 @@
  #include "referencemodel/referencemodel.h"
  
  #include <QDropEvent>
 +#include <QPixmap>
++#include <functional>
  
  
  class PartsBinPaletteWidget;
-@@ -72,6 +73,9 @@
+@@ -72,6 +74,15 @@
  	static void cleanup();
  	static void removePartReference(const QString & moduleID);
  
 +	// icons rendered once per session; repeated searches reuse them
 +	static QHash<QString, QPixmap> IconPixmapCache;
++
++	// Oversized icon svgs are parsed off the GUI thread: a single 2.5 MB icon took
++	// 16 s to render here and stalled every search that included it.
++	static const int IconAsyncThreshold;
++	static void renderIconAsync(const QString & moduleID, const QString & svgFilename, std::function<void()> onReady);
++	static void finishIconRender(const QString & key);
 +
  public:
  	static QHash<QString, QString> TranslatedCategoryNames;
@@ -131,18 +138,154 @@ diff --git a/src/partsbinpalette/partsbinview.h b/src/partsbinpalette/partsbinvi
 diff --git a/src/partsbinpalette/partsbinview.cpp b/src/partsbinpalette/partsbinview.cpp
 --- a/src/partsbinpalette/partsbinview.cpp
 +++ b/src/partsbinpalette/partsbinview.cpp
-@@ -33,6 +33,7 @@
+@@ -23,6 +23,16 @@
+ #include <QDrag>
+ #include <QDragEnterEvent>
+ #include <QMessageBox>
++#include <QThreadPool>
++#include <QThread>
++#include <QFile>
++#include <QFileInfo>
++#include <QImage>
++#include <QColor>
++#include <QPainter>
++#include <QCoreApplication>
++#include <QMetaObject>
++#include <QSvgRenderer>
+ 
+ #include "itemdrag.h"
+ #include "items/itembase.h"
+@@ -33,6 +43,110 @@
  
  QHash<QString, QString> PartsBinView::TranslatedCategoryNames;
  QHash<QString, ItemBase *> PartsBinView::ItemBaseHash;
 +QHash<QString, QPixmap> PartsBinView::IconPixmapCache;
++
++const int PartsBinView::IconAsyncThreshold = 128 * 1024;
++
++namespace {
++
++QHash<QString, QList<std::function<void()>>> & pendingIconRenders() {
++	static QHash<QString, QList<std::function<void()>>> map;
++	return map;
++}
++
++QImage renderIconImage(QSvgRenderer & renderer, const QSize & size, bool opaque) {
++	QImage image(size, QImage::Format_ARGB32_Premultiplied);
++	image.fill(opaque ? QColor(Qt::white) : QColor(Qt::transparent));
++	QSizeF def = renderer.defaultSize();
++	if (def.width() <= 0 || def.height() <= 0) return image;
++
++	double newW = size.width();
++	double newH = newW * def.height() / def.width();
++	if (newH > size.height()) {
++		newH = size.height();
++		newW = newH * def.width() / def.height();
++	}
++	QRectF bounds((size.width() - newW) / 2.0, (size.height() - newH) / 2.0, newW, newH);
++	QPainter painter(&image);
++	renderer.render(&painter, bounds);
++	return image;
++}
++
++class IconRenderTask : public QRunnable {
++public:
++	IconRenderTask(const QString & key, const QString & svgFilename) : m_key(key), m_svgFilename(svgFilename) {}
++
++	void run() override {
++		QByteArray bytes;
++		QFile file(m_svgFilename);
++		if (file.open(QIODevice::ReadOnly)) {
++			bytes = file.readAll();
++		}
++		QImage icon42;
++		QImage icon80;
++		if (!bytes.isEmpty()) {
++			QSvgRenderer renderer;
++			if (renderer.load(bytes)) {
++				icon42 = renderIconImage(renderer, QSize(42, 42), true);
++				icon80 = renderIconImage(renderer, QSize(80, 80), false);
++			}
++		}
++		const QString key = m_key;
++		QMetaObject::invokeMethod(QCoreApplication::instance(), [key, icon42, icon80]() {
++			QPixmap pixmap42(42, 42);
++			pixmap42.fill(Qt::white);
++			if (!icon42.isNull()) {
++				QPainter painter(&pixmap42);
++				painter.drawImage(0, 0, icon42);
++			}
++			QPixmap pixmap80(80, 80);
++			pixmap80.fill(Qt::transparent);
++			if (!icon80.isNull()) {
++				QPainter painter(&pixmap80);
++				painter.drawImage(0, 0, icon80);
++			}
++			PartsBinView::IconPixmapCache.insert(key, pixmap42);
++			PartsBinView::IconPixmapCache.insert(key + "80", pixmap80);
++			PartsBinView::finishIconRender(key);
++		}, Qt::QueuedConnection);
++	}
++
++private:
++	QString m_key;
++	QString m_svgFilename;
++};
++
++} // namespace
++
++void PartsBinView::renderIconAsync(const QString & moduleID, const QString & svgFilename, std::function<void()> onReady) {
++	const QString key = moduleID + "_icon";
++	if (!IconPixmapCache.value(key).isNull()) {
++		onReady();
++		return;
++	}
++	QList<std::function<void()>> & callbacks = pendingIconRenders()[key];
++	callbacks.append(onReady);
++	if (callbacks.count() > 1) {
++		return;
++	}
++	static QThreadPool * iconPool = nullptr;
++	if (iconPool == nullptr) {
++		iconPool = new QThreadPool();
++		iconPool->setMaxThreadCount(qBound(1, QThread::idealThreadCount(), 4));
++	}
++	iconPool->start(new IconRenderTask(key, svgFilename));
++}
++
++void PartsBinView::finishIconRender(const QString & key) {
++	auto it = pendingIconRenders().find(key);
++	if (it == pendingIconRenders().end()) return;
++	QList<std::function<void()>> callbacks = it.value();
++	pendingIconRenders().erase(it);
++	Q_FOREACH (const std::function<void()> & callback, callbacks) {
++		callback();
++	}
++}
++
  
  PartsBinView::PartsBinView(ReferenceModel *referenceModel, PartsBinPaletteWidget *parent)
  	: m_referenceModel(referenceModel),
 diff --git a/src/partsbinpalette/svgiconwidget.cpp b/src/partsbinpalette/svgiconwidget.cpp
 --- a/src/partsbinpalette/svgiconwidget.cpp
 +++ b/src/partsbinpalette/svgiconwidget.cpp
-@@ -199,9 +199,21 @@
+@@ -20,6 +20,7 @@
+ 
+ #include <QPixmap>
+ #include <QPainter>
++#include <QFileInfo>
+ 
+ #include "svgiconwidget.h"
+ #include "sketch/infographicsview.h"
+@@ -28,6 +29,7 @@
+ #include "items/moduleidnames.h"
+ #include "layerattributes.h"
+ #include "referencemodel/referencemodel.h"
++#include "items/partfactory.h"
+ 
+ #include "partsbinview.h"
+ 
+@@ -199,9 +201,21 @@
  	m_itemBase->initLayerAttributes(layerAttributes, viewID, ViewLayer::Icon, ViewLayer::NewTop, false, false);
  	ModelPart * modelPart = m_itemBase->modelPart();
  
@@ -166,15 +309,47 @@ diff --git a/src/partsbinpalette/svgiconwidget.cpp b/src/partsbinpalette/svgicon
  		QPixmap dbIcon = m_referenceModel->retrieveIcon(iconKey);
  		if (!dbIcon.isNull() && dbIcon.width() == ICON_SIZE && dbIcon.height() == ICON_SIZE) {
  			QPixmap pixmap(plural ? *PluralImage : *SingularImage);
-@@ -214,6 +226,7 @@
+@@ -214,11 +228,39 @@
  			painter.end();
  
  			m_pixmapItem = new SvgIconPixmapItem(pixmap, this, plural);
 +			PartsBinView::IconPixmapCache.insert(iconKey, pixmap);
++
++			if (m_itemBase != nullptr) {
++				m_itemBase->setTooltip();
++				setToolTip(m_itemBase->toolTip());
++			}
++			return;
++		}
++	}
  
++	// Oversized icon svgs are parsed off the GUI thread: a single 2.5 MB icon took
++	// 16 s to render here and blocked the whole search that included it.
++	if (modelPart != nullptr && modelPart->modelPartShared() != nullptr) {
++		QString imageName = modelPart->modelPartShared()->imageFileName(viewID, ViewLayer::Icon);
++		QString svgFilename = imageName.isEmpty() ? QString() : PartFactory::getSvgFilename(modelPart, imageName, false, false);
++		QFileInfo svgInfo(svgFilename);
++		if (svgInfo.exists() && svgInfo.size() > PartsBinView::IconAsyncThreshold) {
++			QPixmap placeholder(plural ? *PluralImage : *SingularImage);
++			auto * placeholderItem = new SvgIconPixmapItem(placeholder, this, plural);
++			m_pixmapItem = placeholderItem;
  			if (m_itemBase != nullptr) {
  				m_itemBase->setTooltip();
-@@ -255,8 +268,11 @@
+ 				setToolTip(m_itemBase->toolTip());
+ 			}
++			QPointer<SvgIconWidget> self(this);
++			const QString moduleID = modelPart->moduleID();
++			PartsBinView::renderIconAsync(moduleID, svgFilename, [self, placeholderItem, moduleID]() {
++				if (self.isNull()) return;
++				QPixmap pixmap = PartsBinView::IconPixmapCache.value(moduleID + "_icon");
++				if (pixmap.isNull()) return;
++				placeholderItem->setPixmap(pixmap);
++				self->update();
++			});
+ 			return;
+ 		}
+ 	}
+@@ -255,8 +297,11 @@
  		delete icon;
  	}
  
@@ -190,10 +365,20 @@ diff --git a/src/partsbinpalette/svgiconwidget.cpp b/src/partsbinpalette/svgicon
 diff --git a/src/partsbinpalette/partsbinlistview.cpp b/src/partsbinpalette/partsbinlistview.cpp
 --- a/src/partsbinpalette/partsbinlistview.cpp
 +++ b/src/partsbinpalette/partsbinlistview.cpp
-@@ -393,6 +393,20 @@
+@@ -21,6 +21,8 @@
+ 
+ #include <QMenu>
+ #include <QMimeData>
++#include <QFileInfo>
++#include <QPointer>
+ 
+ #include "infoview/htmlinfoview.h"
+ #include "items/itembase.h"
+@@ -392,6 +394,54 @@
+ 			return;
  		}
  	}
- 
++
 +	QPixmap cachedIcon = PartsBinView::IconPixmapCache.value(moduleID + "_icon");
 +	if (!cachedIcon.isNull()) {
 +		ItemBase * cachedItemBase = ItemBaseHash.value(moduleID);
@@ -208,9 +393,42 @@ diff --git a/src/partsbinpalette/partsbinlistview.cpp b/src/partsbinpalette/part
 +		return;
 +	}
 +
++	// Oversized icon svgs are rendered in the background (see SvgIconWidget::setupImage).
++	if (modelPart->modelPartShared() != nullptr) {
++		QString imageName = modelPart->modelPartShared()->imageFileName(ViewLayer::IconView, ViewLayer::Icon);
++		QString svgFilename = imageName.isEmpty() ? QString() : PartFactory::getSvgFilename(modelPart, imageName, false, false);
++		QFileInfo svgInfo(svgFilename);
++		if (svgInfo.exists() && svgInfo.size() > PartsBinView::IconAsyncThreshold) {
++			ItemBase * asyncItemBase = ItemBaseHash.value(moduleID);
++			if (asyncItemBase == nullptr) {
++				asyncItemBase = PartFactory::createPart(modelPart, ViewLayer::NewTop, ViewLayer::IconView, ViewGeometry(), ItemBase::getNextID(), nullptr, nullptr, false);
++				ItemBaseHash.insert(moduleID, asyncItemBase);
++			}
++			lwi->setData(Qt::UserRole, QVariant::fromValue( asyncItemBase ) );
++			lwi->setData(Qt::UserRole + 2, moduleID);
++			QPixmap placeholder(iconSize());
++			placeholder.fill(Qt::transparent);
++			lwi->setIcon(QIcon(placeholder));
++			m_itemBaseHash.insert(moduleID, asyncItemBase);
++
++			QPointer<PartsBinListView> self(this);
++			PartsBinView::renderIconAsync(moduleID, svgFilename, [self, moduleID]() {
++				if (self.isNull()) return;
++				QPixmap pixmap = PartsBinView::IconPixmapCache.value(moduleID + "_icon80");
++				if (pixmap.isNull()) return;
++				for (int i = 0; i < self->count(); i++) {
++					QListWidgetItem * lwi = self->item(i);
++					if (lwi != nullptr && lwi->data(Qt::UserRole + 2).toString() == moduleID) {
++						lwi->setIcon(QIcon(pixmap));
++					}
++				}
++			});
++			return;
++		}
++	}
+ 
  	ItemBase * itemBase = ItemBaseHash.value(moduleID);
  	if (itemBase == nullptr) {
- 		itemBase = PartFactory::createPart(modelPart, ViewLayer::NewTop, ViewLayer::IconView, ViewGeometry(), ItemBase::getNextID(), nullptr, nullptr, false);
 diff --git a/src/partsbinpalette/partsbiniconview.cpp b/src/partsbinpalette/partsbiniconview.cpp
 --- a/src/partsbinpalette/partsbiniconview.cpp
 +++ b/src/partsbinpalette/partsbiniconview.cpp
