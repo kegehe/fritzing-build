@@ -1,51 +1,178 @@
 diff --git a/src/partsbinpalette/binmanager/binmanager.cpp b/src/partsbinpalette/binmanager/binmanager.cpp
-index 29f4dd8..2a13001 100644
 --- a/src/partsbinpalette/binmanager/binmanager.cpp
 +++ b/src/partsbinpalette/binmanager/binmanager.cpp
-@@ -979,9 +979,21 @@ void BinManager::search(const QString & searchText) {
+@@ -27,6 +27,8 @@
+ #include <QInputDialog>
+ #include <QDropEvent>
+ #include <QMimeData>
++#include <QApplication>
++#include <QElapsedTimer>
+ 
+ #include "binmanager.h"
+ #include "stacktabwidget.h"
+@@ -963,7 +965,6 @@
+ 	FileProgressDialog progress(tr("Searching..."), 0, this);
+ 	progress.setIncValueMod(10);
+ 	connect(m_referenceModel, SIGNAL(addSearchMaximum(int)), &progress, SLOT(addMaximum(int)));
+-	connect(m_referenceModel, SIGNAL(incSearch()), &progress, SLOT(incValue()));
+ 
+ 	QString effectiveSearchText = searchText;
+ 	bool allowObsolete = false;
+@@ -979,9 +980,25 @@
  	}
  	QList<ModelPart *> modelParts = m_referenceModel->search(effectiveSearchText, allowObsolete);
  
 -	progress.setIncValueMod(1);
-+	// Broad queries (a single letter matches all bundled parts) used to create one widget
-+	// per result; each add triggered a full flow-layout pass, freezing the UI for minutes.
-+	// Cap the number of widgets and lay them out in one batch instead.
++	// One widget per result used to be created while pumping the event loop for every
++	// scanned and matched part: the visible bin repainted and re-ran its flow layout
++	// thousands of times per search, freezing the UI for minutes. Create the result
++	// widgets in a batch with repaints paused, and stop after a time budget or a cap.
 +	const int maxSearchResults = 300;
++	const qint64 maxSearchMillis = 5000;
++	QElapsedTimer searchTimer;
++	searchTimer.start();
 +	int displayed = 0;
 +	bool truncated = false;
 +
-+	progress.setIncValueMod(10);
++	searchBin->setUpdatesEnabled(false);
  	searchBin->removeParts();
 +	searchBin->beginBulkAdd();
  	Q_FOREACH (ModelPart * modelPart, modelParts) {
-+		if (displayed >= maxSearchResults) {
++		if (displayed >= maxSearchResults || searchTimer.elapsed() >= maxSearchMillis) {
 +			truncated = true;
 +			break;
 +		}
  		//DebugDialog::debug(modelPart->title());
  		if (modelPart->itemType() == ModelPart::SchematicSubpart) {
  		}
-@@ -989,9 +1001,15 @@ void BinManager::search(const QString & searchText) {
+@@ -989,8 +1006,18 @@
  		}
  		else {
  			this->addPartTo(searchBin, modelPart, false);
 +			displayed++;
++			if (displayed % 40 == 0) {
++				QApplication::processEvents();
++			}
  		}
- 		progress.incValue();
- 	}
+-		progress.incValue();
++	}
 +	searchBin->endBulkAdd();
++	searchBin->setUpdatesEnabled(true);
++	searchBin->update();
 +
 +	if (truncated && m_mainWindow != nullptr) {
-+		m_mainWindow->statusMessage(tr("Too many results; showing the first %1. Refine your search.").arg(maxSearchResults), 8000);
-+	}
++		m_mainWindow->statusMessage(tr("Showing the first %1 search results. Refine your search to see more.").arg(displayed), 8000);
+ 	}
  
  	setDirtyTab(searchBin);
- }
+diff --git a/src/partsbinpalette/partsbinview.h b/src/partsbinpalette/partsbinview.h
+--- a/src/partsbinpalette/partsbinview.h
++++ b/src/partsbinpalette/partsbinview.h
+@@ -26,6 +26,7 @@
+ #include "referencemodel/referencemodel.h"
+ 
+ #include <QDropEvent>
++#include <QPixmap>
+ 
+ 
+ class PartsBinPaletteWidget;
+@@ -72,6 +73,9 @@
+ 	static void cleanup();
+ 	static void removePartReference(const QString & moduleID);
+ 
++	// icons rendered once per session; repeated searches reuse them
++	static QHash<QString, QPixmap> IconPixmapCache;
++
+ public:
+ 	static QHash<QString, QString> TranslatedCategoryNames;
+ 
+diff --git a/src/partsbinpalette/partsbinview.cpp b/src/partsbinpalette/partsbinview.cpp
+--- a/src/partsbinpalette/partsbinview.cpp
++++ b/src/partsbinpalette/partsbinview.cpp
+@@ -33,6 +33,7 @@
+ 
+ QHash<QString, QString> PartsBinView::TranslatedCategoryNames;
+ QHash<QString, ItemBase *> PartsBinView::ItemBaseHash;
++QHash<QString, QPixmap> PartsBinView::IconPixmapCache;
+ 
+ PartsBinView::PartsBinView(ReferenceModel *referenceModel, PartsBinPaletteWidget *parent)
+ 	: m_referenceModel(referenceModel),
+diff --git a/src/partsbinpalette/svgiconwidget.cpp b/src/partsbinpalette/svgiconwidget.cpp
+--- a/src/partsbinpalette/svgiconwidget.cpp
++++ b/src/partsbinpalette/svgiconwidget.cpp
+@@ -199,9 +199,21 @@
+ 	m_itemBase->initLayerAttributes(layerAttributes, viewID, ViewLayer::Icon, ViewLayer::NewTop, false, false);
+ 	ModelPart * modelPart = m_itemBase->modelPart();
+ 
+-	// Try database first for faster loading
++	QString iconKey;
++	// Try the in-memory cache first, then the database, then render the svg. Repeated
++	// searches for the same parts used to re-parse every icon svg from scratch.
+ 	if (m_referenceModel != nullptr && modelPart != nullptr) {
+-		QString iconKey = modelPart->moduleID() + "_icon";
++		iconKey = modelPart->moduleID() + "_icon";
++		QPixmap cachedIcon = PartsBinView::IconPixmapCache.value(iconKey);
++		if (!cachedIcon.isNull()) {
++			m_pixmapItem = new SvgIconPixmapItem(cachedIcon, this, plural);
++			if (m_itemBase != nullptr) {
++				m_itemBase->setTooltip();
++				setToolTip(m_itemBase->toolTip());
++			}
++			return;
++		}
++
+ 		QPixmap dbIcon = m_referenceModel->retrieveIcon(iconKey);
+ 		if (!dbIcon.isNull() && dbIcon.width() == ICON_SIZE && dbIcon.height() == ICON_SIZE) {
+ 			QPixmap pixmap(plural ? *PluralImage : *SingularImage);
+@@ -214,6 +226,7 @@
+ 			painter.end();
+ 
+ 			m_pixmapItem = new SvgIconPixmapItem(pixmap, this, plural);
++			PartsBinView::IconPixmapCache.insert(iconKey, pixmap);
+ 
+ 			if (m_itemBase != nullptr) {
+ 				m_itemBase->setTooltip();
+@@ -255,8 +268,11 @@
+ 		delete icon;
+ 	}
+ 
+-    /// @todo make sure this doesn't leak if this function is called multiple times on the same object.
++	/// @todo make sure this doesn't leak if this function is called multiple times on the same object.
+ 	m_pixmapItem = new SvgIconPixmapItem(pixmap, this, plural);
++	if (!iconKey.isEmpty()) {
++		PartsBinView::IconPixmapCache.insert(iconKey, pixmap);
++	}
+ 
+ 	if (m_itemBase != nullptr) {
+ 		m_itemBase->setTooltip();
+diff --git a/src/partsbinpalette/partsbinlistview.cpp b/src/partsbinpalette/partsbinlistview.cpp
+--- a/src/partsbinpalette/partsbinlistview.cpp
++++ b/src/partsbinpalette/partsbinlistview.cpp
+@@ -393,6 +393,20 @@
+ 		}
+ 	}
+ 
++	QPixmap cachedIcon = PartsBinView::IconPixmapCache.value(moduleID + "_icon");
++	if (!cachedIcon.isNull()) {
++		ItemBase * cachedItemBase = ItemBaseHash.value(moduleID);
++		if (cachedItemBase == nullptr) {
++			cachedItemBase = PartFactory::createPart(modelPart, ViewLayer::NewTop, ViewLayer::IconView, ViewGeometry(), ItemBase::getNextID(), nullptr, nullptr, false);
++			ItemBaseHash.insert(moduleID, cachedItemBase);
++		}
++		lwi->setData(Qt::UserRole, QVariant::fromValue( cachedItemBase ) );
++		lwi->setIcon(QIcon(cachedIcon.scaled(iconSize(), Qt::KeepAspectRatio, Qt::SmoothTransformation)));
++		lwi->setData(Qt::UserRole + 1, cachedIcon.size());
++		m_itemBaseHash.insert(moduleID, cachedItemBase);
++		return;
++	}
++
+ 	ItemBase * itemBase = ItemBaseHash.value(moduleID);
+ 	if (itemBase == nullptr) {
+ 		itemBase = PartFactory::createPart(modelPart, ViewLayer::NewTop, ViewLayer::IconView, ViewGeometry(), ItemBase::getNextID(), nullptr, nullptr, false);
 diff --git a/src/partsbinpalette/partsbiniconview.cpp b/src/partsbinpalette/partsbiniconview.cpp
-index 172934c..336b735 100644
 --- a/src/partsbinpalette/partsbiniconview.cpp
 +++ b/src/partsbinpalette/partsbiniconview.cpp
-@@ -134,7 +134,22 @@ void PartsBinIconView::doClear() {
+@@ -134,7 +134,22 @@
  
  void PartsBinIconView::addPart(ModelPart * model, int position) {
  	PartsBinView::addPart(model, position);
@@ -70,10 +197,9 @@ index 172934c..336b735 100644
  
  void PartsBinIconView::removePart(const QString &moduleID) {
 diff --git a/src/partsbinpalette/partsbiniconview.h b/src/partsbinpalette/partsbiniconview.h
-index 1fd8cb8..4b757ba 100644
 --- a/src/partsbinpalette/partsbiniconview.h
 +++ b/src/partsbinpalette/partsbiniconview.h
-@@ -42,6 +42,8 @@ public:
+@@ -42,6 +42,8 @@
  	void loadFromModel(PaletteModel *);
  	void setPaletteModel(PaletteModel *model, bool clear=false);
  	void addPart(ModelPart * model, int position = -1);
@@ -82,7 +208,7 @@ index 1fd8cb8..4b757ba 100644
  	void removePart(const QString &moduleID);
  	void removeParts();
  
-@@ -102,6 +104,7 @@ protected:
+@@ -102,6 +104,7 @@
  
  	QMenu *m_itemMenu = nullptr;
  	bool m_noSelectionChangeEmition = false;
@@ -91,10 +217,9 @@ index 1fd8cb8..4b757ba 100644
  
  #endif /* ICONVIEW_H_ */
 diff --git a/src/partsbinpalette/partsbinpalettewidget.cpp b/src/partsbinpalette/partsbinpalettewidget.cpp
-index b6b0a6d..47b4fa7 100644
 --- a/src/partsbinpalette/partsbinpalettewidget.cpp
 +++ b/src/partsbinpalette/partsbinpalettewidget.cpp
-@@ -377,6 +377,14 @@ void PartsBinPaletteWidget::addPart(ModelPart *modelPart, int position) {
+@@ -377,6 +377,14 @@
  	}
  }
  
@@ -110,10 +235,9 @@ index b6b0a6d..47b4fa7 100644
  	auto *toolBtn = new QToolButton(this);
  	toolBtn->setObjectName(btnObjName);
 diff --git a/src/partsbinpalette/partsbinpalettewidget.h b/src/partsbinpalette/partsbinpalettewidget.h
-index a7fe171..eef1bc8 100644
 --- a/src/partsbinpalette/partsbinpalettewidget.h
 +++ b/src/partsbinpalette/partsbinpalettewidget.h
-@@ -49,6 +49,8 @@ public:
+@@ -49,6 +49,8 @@
  	void setPaletteModel(PaletteModel *model, bool clear = false);
  
  	void addPart(ModelPart *modelPart, int position = -1);
