@@ -1,0 +1,124 @@
+diff --git a/src/partsbinpalette/binmanager/binmanager.cpp b/src/partsbinpalette/binmanager/binmanager.cpp
+index 29f4dd8..2a13001 100644
+--- a/src/partsbinpalette/binmanager/binmanager.cpp
++++ b/src/partsbinpalette/binmanager/binmanager.cpp
+@@ -979,9 +979,21 @@ void BinManager::search(const QString & searchText) {
+ 	}
+ 	QList<ModelPart *> modelParts = m_referenceModel->search(effectiveSearchText, allowObsolete);
+ 
+-	progress.setIncValueMod(1);
++	// Broad queries (a single letter matches all bundled parts) used to create one widget
++	// per result; each add triggered a full flow-layout pass, freezing the UI for minutes.
++	// Cap the number of widgets and lay them out in one batch instead.
++	const int maxSearchResults = 300;
++	int displayed = 0;
++	bool truncated = false;
++
++	progress.setIncValueMod(10);
+ 	searchBin->removeParts();
++	searchBin->beginBulkAdd();
+ 	Q_FOREACH (ModelPart * modelPart, modelParts) {
++		if (displayed >= maxSearchResults) {
++			truncated = true;
++			break;
++		}
+ 		//DebugDialog::debug(modelPart->title());
+ 		if (modelPart->itemType() == ModelPart::SchematicSubpart) {
+ 		}
+@@ -989,9 +1001,15 @@ void BinManager::search(const QString & searchText) {
+ 		}
+ 		else {
+ 			this->addPartTo(searchBin, modelPart, false);
++			displayed++;
+ 		}
+ 		progress.incValue();
+ 	}
++	searchBin->endBulkAdd();
++
++	if (truncated && m_mainWindow != nullptr) {
++		m_mainWindow->statusMessage(tr("Too many results; showing the first %1. Refine your search.").arg(maxSearchResults), 8000);
++	}
+ 
+ 	setDirtyTab(searchBin);
+ }
+diff --git a/src/partsbinpalette/partsbiniconview.cpp b/src/partsbinpalette/partsbiniconview.cpp
+index 172934c..336b735 100644
+--- a/src/partsbinpalette/partsbiniconview.cpp
++++ b/src/partsbinpalette/partsbiniconview.cpp
+@@ -134,7 +134,22 @@ void PartsBinIconView::doClear() {
+ 
+ void PartsBinIconView::addPart(ModelPart * model, int position) {
+ 	PartsBinView::addPart(model, position);
+-	updateSize();
++	if (m_bulkAddDepth == 0) {
++		updateSize();
++	}
++}
++
++void PartsBinIconView::beginBulkAdd() {
++	m_bulkAddDepth++;
++}
++
++void PartsBinIconView::endBulkAdd() {
++	if (m_bulkAddDepth > 0) {
++		m_bulkAddDepth--;
++	}
++	if (m_bulkAddDepth == 0) {
++		updateSize();
++	}
+ }
+ 
+ void PartsBinIconView::removePart(const QString &moduleID) {
+diff --git a/src/partsbinpalette/partsbiniconview.h b/src/partsbinpalette/partsbiniconview.h
+index 1fd8cb8..4b757ba 100644
+--- a/src/partsbinpalette/partsbiniconview.h
++++ b/src/partsbinpalette/partsbiniconview.h
+@@ -42,6 +42,8 @@ public:
+ 	void loadFromModel(PaletteModel *);
+ 	void setPaletteModel(PaletteModel *model, bool clear=false);
+ 	void addPart(ModelPart * model, int position = -1);
++	void beginBulkAdd();
++	void endBulkAdd();
+ 	void removePart(const QString &moduleID);
+ 	void removeParts();
+ 
+@@ -102,6 +104,7 @@ protected:
+ 
+ 	QMenu *m_itemMenu = nullptr;
+ 	bool m_noSelectionChangeEmition = false;
++	int m_bulkAddDepth = 0;
+ };
+ 
+ #endif /* ICONVIEW_H_ */
+diff --git a/src/partsbinpalette/partsbinpalettewidget.cpp b/src/partsbinpalette/partsbinpalettewidget.cpp
+index b6b0a6d..47b4fa7 100644
+--- a/src/partsbinpalette/partsbinpalettewidget.cpp
++++ b/src/partsbinpalette/partsbinpalettewidget.cpp
+@@ -377,6 +377,14 @@ void PartsBinPaletteWidget::addPart(ModelPart *modelPart, int position) {
+ 	}
+ }
+ 
++void PartsBinPaletteWidget::beginBulkAdd() {
++	m_iconView->beginBulkAdd();
++}
++
++void PartsBinPaletteWidget::endBulkAdd() {
++	m_iconView->endBulkAdd();
++}
++
+ QToolButton* PartsBinPaletteWidget::newToolButton(const QString& btnObjName, const QString& imgPath, const QString &text) {
+ 	auto *toolBtn = new QToolButton(this);
+ 	toolBtn->setObjectName(btnObjName);
+diff --git a/src/partsbinpalette/partsbinpalettewidget.h b/src/partsbinpalette/partsbinpalettewidget.h
+index a7fe171..eef1bc8 100644
+--- a/src/partsbinpalette/partsbinpalettewidget.h
++++ b/src/partsbinpalette/partsbinpalettewidget.h
+@@ -49,6 +49,8 @@ public:
+ 	void setPaletteModel(PaletteModel *model, bool clear = false);
+ 
+ 	void addPart(ModelPart *modelPart, int position = -1);
++	void beginBulkAdd();
++	void endBulkAdd();
+ 
+ 	bool currentBinIsCore();
+ 	bool beforeClosing();
